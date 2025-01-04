@@ -1,310 +1,249 @@
 import os
+import pandas as pd
 from openai import OpenAI
 from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
-import numpy as np
 from flask import Flask, request, jsonify, render_template
 
+collection_name = "supervisor_interests"
 app = Flask(__name__, static_folder='static')
 
-# --- Krok 1: Połączenie z Milvus ---
 def connect_milvus(host='localhost', port='19530'):
     connections.connect(alias="default", host=host, port=port)
     print("Successfully connected to Milvus!")
 
+def read_excel_data(file_path='promotorzy.xlsx'):
+    try:
+        df = pd.read_excel(file_path)
+        return df
+    except Exception as e:
+        print(f"Error reading Excel file: {e}")
+        return None
 
-# --- Krok 2: Definicja Promotorów i Ich Zainteresowań ---
-def define_promoters():
-    promotorzy = [
-        {
-            "id": 1,
-            "nazwa": "Dr. Jan Kowalski",
-            "zainteresowania": [
-                "Uczenie maszynowe",
-                "Analiza danych",
-                "Sztuczna inteligencja w medycynie"
-            ]
-        },
-        {
-            "id": 2,
-            "nazwa": "Dr. Anna Nowak",
-            "zainteresowania": [
-                "Inżynieria oprogramowania",
-                "Systemy rozproszone",
-                "Bezpieczeństwo komputerowe"
-            ]
-        },
-        {
-            "id": 3,
-            "nazwa": "Dr. Piotr Wiśniewski",
-            "zainteresowania": [
-                "Robotyka",
-                "Internet rzeczy (IoT)",
-                "Automatyzacja przemysłowa"
-            ]
-        },
-        {
-            "id": 4,
-            "nazwa": "Prof. Dr. hab. inż. Mariusz Siedem",
-            "zainteresowania": [
-                "Tajski boks",
-                "Błotne SPA",
-                "Gra o tron"
-            ]
-        }
-    ]
-    return promotorzy
+def define_supervisors():
+    try:
+        df = read_excel_data()
+        if df is not None:
+            supervisors = []
+            for index, row in df.iterrows():
+                if pd.notna(row['Nazwa']):
+                    # Split and convert to lowercase
+                    interests = [z.strip().lower() for z in str(row['Zainteresowania']).split(';')] if pd.notna(
+                        row['Zainteresowania']) else []
+                    papers = [p.strip().lower() for p in str(row['Prace naukowe']).split(';')] if pd.notna(
+                        row['Prace naukowe']) else []
 
+                    # Remove empty strings
+                    interests = [z for z in interests if z]
+                    papers = [p for p in papers if p]
 
-# --- Krok 3: Konfiguracja OpenAI API ---
+                    supervisor = {
+                        "id": index + 1,
+                        "name": row['Nazwa'].strip(),
+                        "department": row['Katedra'].strip() if pd.notna(row['Katedra']) else "",
+                        "email": row['Email'].strip() if pd.notna(row['Email']) else "",
+                        "interests": interests,
+                        "research_papers": papers
+                    }
+                    supervisors.append(supervisor)
+            print(f"Loaded {len(supervisors)} supervisors from Excel")
+            return supervisors
+    except Exception as e:
+        print(f"Error processing Excel data: {e}")
+        return []
+
 def configure_openai():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise ValueError("OpenAI API key not set. Please set the OPENAI_API_KEY environment variable.")
     return OpenAI(api_key=api_key)
 
-
-# --- Krok 4: Generowanie Embeddingów ---
-def generuj_embedding(tekst, client):
+def generate_embedding(text, client):
     try:
         response = client.embeddings.create(
-            input=tekst,
+            input=text,
             model="text-embedding-ada-002"
         )
         return response.data[0].embedding
     except Exception as e:
-        print(f"Error generating embedding for '{tekst}': {e}")
+        print(f"Error generating embedding for '{text}': {e}")
         return None
 
-
-def generate_embeddings(promotorzy, client):
-    for promotor in promotorzy:
-        promotor['embeddingy'] = []
-        for zainteresowanie in promotor['zainteresowania']:
-            embedding = generuj_embedding(zainteresowanie, client)
+def generate_embeddings(supervisors, client):
+    for supervisor in supervisors:
+        supervisor['embeddings'] = []
+        # Generate embeddings for interests
+        for interest in supervisor['interests']:
+            embedding = generate_embedding(interest, client)
             if embedding:
-                promotor['embeddingy'].append({
-                    "zainteresowanie": zainteresowanie,
+                supervisor['embeddings'].append({
+                    "type": "interest",
+                    "text": interest,
                     "embedding": embedding
                 })
-    return promotorzy
+        # Generate embeddings for research papers
+        for paper in supervisor['research_papers']:
+            embedding = generate_embedding(paper, client)
+            if embedding:
+                supervisor['embeddings'].append({
+                    "type": "research_paper",
+                    "text": paper,
+                    "embedding": embedding
+                })
+    return supervisors
 
-
-# --- Krok 5: Definicja i Tworzenie Kolekcji w Milvus ---
 def create_collection(collection_name, dim=1536):
-    # Only create if collection doesn't exist
     if not utility.has_collection(collection_name):
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
-            FieldSchema(name="promotor_id", dtype=DataType.INT64, description="ID promotora"),
-            FieldSchema(name="nazwa_promotora", dtype=DataType.VARCHAR, max_length=100, description="Nazwa promotora"),
-            FieldSchema(name="zainteresowanie", dtype=DataType.VARCHAR, max_length=255,
-                        description="Opis zainteresowania"),
-            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim, description="Embedding wektor")
+            FieldSchema(name="supervisor_id", dtype=DataType.INT64, description="Supervisor ID"),
+            FieldSchema(name="supervisor_name", dtype=DataType.VARCHAR, max_length=200),
+            FieldSchema(name="department", dtype=DataType.VARCHAR, max_length=200),
+            FieldSchema(name="email", dtype=DataType.VARCHAR, max_length=200),
+            FieldSchema(name="type", dtype=DataType.VARCHAR, max_length=20),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=2000),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=dim)
         ]
-        schema = CollectionSchema(fields, description="Kolekcja zainteresowań promotorów")
+        schema = CollectionSchema(fields)
         collection = Collection(name=collection_name, schema=schema)
-        print(f"Kolekcja '{collection_name}' została utworzona.")
+        print(f"Collection '{collection_name}' has been created.")
     else:
         collection = Collection(name=collection_name)
-        print(f"Używam istniejącej kolekcji '{collection_name}'")
+        print(f"Using existing collection '{collection_name}'")
     return collection
 
-
-def check_if_promotor_exists(collection, promotor_id):
-    collection.load()
-    results = collection.query(
-        expr=f"promotor_id == {promotor_id}",
-        output_fields=["promotor_id"],
-        limit=1
-    )
-    return len(results) > 0
-
-
-# --- Krok 6: Wstawianie Danych do Kolekcji ---
-def insert_data(collection, promotorzy):
-    for promotor in promotorzy:
-        # Check if promotor already exists
-        if check_if_promotor_exists(collection, promotor['id']):
-            print(f"Promotor {promotor['nazwa']} już istnieje w bazie. Pomijam.")
-            continue
-
+def insert_data(collection, supervisors):
+    for supervisor in supervisors:
         data_to_insert = {
-            "promotor_id": [],
-            "nazwa_promotora": [],
-            "zainteresowanie": [],
+            "supervisor_id": [],
+            "supervisor_name": [],
+            "department": [],
+            "email": [],
+            "type": [],
+            "text": [],
             "embedding": []
         }
 
-        for z_entry in promotor['embeddingy']:
-            data_to_insert["promotor_id"].append(promotor['id'])
-            data_to_insert["nazwa_promotora"].append(promotor['nazwa'])
-            data_to_insert["zainteresowanie"].append(z_entry['zainteresowanie'])
-            data_to_insert["embedding"].append(z_entry['embedding'])
+        for entry in supervisor['embeddings']:
+            data_to_insert["supervisor_id"].append(supervisor['id'])
+            data_to_insert["supervisor_name"].append(supervisor['name'])
+            data_to_insert["department"].append(supervisor.get('department', ''))
+            data_to_insert["email"].append(supervisor.get('email', ''))
+            data_to_insert["type"].append(entry['type'])
+            data_to_insert["text"].append(entry['text'])
+            data_to_insert["embedding"].append(entry['embedding'])
 
-        if data_to_insert["promotor_id"]:
+        if data_to_insert["supervisor_id"]:
             data_to_insert["embedding"] = [list(map(float, emb)) for emb in data_to_insert["embedding"]]
-            insert_result = collection.insert([
-                data_to_insert["promotor_id"],
-                data_to_insert["nazwa_promotora"],
-                data_to_insert["zainteresowanie"],
+            collection.insert([
+                data_to_insert["supervisor_id"],
+                data_to_insert["supervisor_name"],
+                data_to_insert["department"],
+                data_to_insert["email"],
+                data_to_insert["type"],
+                data_to_insert["text"],
                 data_to_insert["embedding"]
             ])
-            collection.flush()  # Make sure data is written to disk
-            print(f"Wstawiono dane dla promotora {promotor['nazwa']}")
+            collection.flush()
+            print(f"Inserted data for supervisor {supervisor['name']}")
 
-
-# --- Krok 7: Tworzenie Indeksu dla Wektorów ---
 def create_index_if_needed(collection):
-    # Check if index exists
     index_info = collection.indexes
     if not index_info:
         index_params = {
             "index_type": "IVF_FLAT",
-            "metric_type": "L2",
+            "metric_type": "COSINE",
             "params": {"nlist": 128}
         }
         collection.create_index(field_name="embedding", index_params=index_params)
-        print("Utworzono nowy indeks.")
+        print("Created new index.")
     else:
-        print("Indeks już istnieje.")
+        print("Index already exists.")
 
-
-# --- Krok 8: Sprawdzanie Danych w Milvus ---
-def check_all_milvus_data(collection_name):
-    try:
-        # Get collection
-        collection = Collection(collection_name)
-
-        # Load collection
-        collection.load()
-
-        # Get total count
-        total_count = collection.num_entities
-        print(f"\n=== MILVUS DATABASE CONTENT ===")
-        print(f"Total number of entries: {total_count}")
-
-        if total_count > 0:
-            # Query all data
-            results = collection.query(
-                expr="promotor_id >= 0",  # This will get all records
-                output_fields=["promotor_id", "nazwa_promotora", "zainteresowanie"],
-                limit=total_count  # Get all records
-            )
-
-            # Group by promotor
-            promotor_data = {}
-            for r in results:
-                promotor_id = r['promotor_id']
-                if promotor_id not in promotor_data:
-                    promotor_data[promotor_id] = {
-                        'nazwa': r['nazwa_promotora'],
-                        'zainteresowania': []
-                    }
-                promotor_data[promotor_id]['zainteresowania'].append(r['zainteresowanie'])
-
-            # Print organized data
-            print("\nStored Supervisors and their interests:")
-            print("=====================================")
-            for promotor_id, data in promotor_data.items():
-                print(f"\nPromotor ID: {promotor_id}")
-                print(f"Nazwa: {data['nazwa']}")
-                print("Zainteresowania:")
-                for i, zainteresowanie in enumerate(data['zainteresowania'], 1):
-                    print(f"  {i}. {zainteresowanie}")
-                print("-------------------------------------")
-
-        else:
-            print("No data found in the collection!")
-
-        collection.release()
-        return total_count > 0
-
-    except Exception as e:
-        print(f"Error checking Milvus data: {e}")
-        return False
-
-
-# --- Krok 9: Wyszukiwanie Najbliższych Sąsiadów ---
-def znajdz_podobne_zainteresowania(collection, zapytanie, client, top_k=5):
-    embedding_zapytania = generuj_embedding(zapytanie, client)
-    if not embedding_zapytania:
-        print("Nie udało się wygenerować embeddingu dla zapytania.")
+def find_similar_interests(collection, query, client, top_k=5):
+    query = query.lower()
+    embedding_query = generate_embedding(query, client)
+    if not embedding_query:
+        print("Failed to generate embedding for query.")
         return
 
     collection.load()
     search_params = {
-        "metric_type": "L2",
+        "metric_type": "COSINE",
         "params": {"nprobe": 10}
     }
 
+    # Increase limit to get more potential matches
     results = collection.search(
-        data=[embedding_zapytania],
+        data=[embedding_query],
         anns_field="embedding",
         param=search_params,
-        limit=top_k,
+        limit=100,  # Increased from 40
         expr=None,
-        output_fields=["nazwa_promotora", "zainteresowanie"]
+        output_fields=["supervisor_name", "department", "email", "type", "text"]
     )
 
-    print(f"\nNajbliżsi sąsiedzi dla zapytania: '{zapytanie}'")
-    response = []
-    for i, result in enumerate(results[0]):
-        response.append({
-            "supervisor": result.entity.get("nazwa_promotora"),
-            "zainteresowanie": result.entity.get("zainteresowanie"),
-            "Odległość": result.distance
-        })
-        print(f"Rank {i + 1}:")
-        print(f"Promotor: {result.entity.get('nazwa_promotora')}")
-        print(f"Zainteresowanie: {result.entity.get('zainteresowanie')}")
-        print(f"Odległość: {result.distance}\n")
-    return response
+    supervisor_results = {}
+    for hit in results[0]:
+        supervisor = hit.entity.get("supervisor_name")
+        if supervisor not in supervisor_results:
+            supervisor_results[supervisor] = {
+                "department": hit.entity.get("department"),
+                "email": hit.entity.get("email"),
+                "interests": [],
+                "research_papers": []
+            }
 
-# --- Krok 10: Dodawanie Nowego Promotora ---
-def add_new_supervisor(collection_name, supervisor_data, client):
-    """
-    Add a new supervisor to the existing database.
+        if hit.entity.get("type") == "interest":
+            supervisor_results[supervisor]["interests"].append({
+                "text": hit.entity.get("text"),
+                "distance": hit.distance
+            })
+        else:
+            supervisor_results[supervisor]["research_papers"].append({
+                "text": hit.entity.get("text"),
+                "distance": hit.distance
+            })
 
-    supervisor_data format:
-    {
-        "id": int,
-        "nazwa": str,
-        "zainteresowania": list[str]
-    }
-    """
-    try:
-        # Get collection
-        collection = Collection(collection_name)
+    final_results = []
+    for supervisor, data in supervisor_results.items():
+        # Get all matches sorted by distance
+        top_interests = sorted(data["interests"], key=lambda x: x['distance'])
+        top_papers = sorted(data["research_papers"], key=lambda x: x['distance'])
 
-        # Generate embeddings for the new supervisor
-        supervisor = generate_embeddings([supervisor_data], client)[0]
+        # Calculate average using all matches
+        interests_avg = sum(m['distance'] for m in top_interests) / len(top_interests) if top_interests else 0
+        papers_avg = sum(m['distance'] for m in top_papers) / len(top_papers) if top_papers else 0
 
-        # Insert the new supervisor
-        insert_data(collection, [supervisor])
+        total_matches = len(top_interests) + len(top_papers)
+        if total_matches > 0:
+            combined_avg = (interests_avg * len(top_interests) + papers_avg * len(top_papers)) / total_matches
 
-        print(f"Successfully added supervisor: {supervisor_data['nazwa']}")
-        return True
-    except Exception as e:
-        print(f"Error adding supervisor: {e}")
-        return False
+            final_results.append({
+                "supervisor": supervisor,
+                "average_score": combined_avg,
+                "top_interests": [m['text'] for m in top_interests],  # All interests
+                "top_papers": [m['text'] for m in top_papers]         # All papers
+            })
+
+    final_results.sort(key=lambda x: x['average_score'], reverse=True)
+    return final_results
 
 @app.route('/')
 def home():
     return render_template('index.html')
 
 @app.route('/api/zapytanie', methods=['POST'])
-def api_zapytanie():
+def handle_query():
     data = request.json
-    zapytanie = data.get("zapytanie")
+    query = data.get("zapytanie")
 
-    if not zapytanie:
+    if not query:
         return jsonify({"error": "Zapytanie jest wymagane."}), 400
 
     try:
         client = configure_openai()
-        collection = Collection("promotorzy_zainteresowania")
-        results = znajdz_podobne_zainteresowania(collection, zapytanie, client)
-        print(results)
+        collection = Collection(collection_name)
+        results = find_similar_interests(collection, query, client)
 
         if results:
             return jsonify({"results": results})
@@ -314,51 +253,28 @@ def api_zapytanie():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
-
-# --- Główny Blok Skryptu ---
 if __name__ == "__main__":
     try:
-        # Connect to Milvus
         connect_milvus()
-        collection_name = "promotorzy_zainteresowania"
-
-        # Initialize OpenAI client
         client = configure_openai()
 
-        # Check if we need to perform initial setup
         if not utility.has_collection(collection_name):
             print("Performing initial setup...")
-            promotorzy = define_promoters()
-            promotorzy = generate_embeddings(promotorzy, client)
             collection = create_collection(collection_name)
-            insert_data(collection, promotorzy)
-            # Create index after inserting data
+            supervisors = define_supervisors()
+            supervisors = generate_embeddings(supervisors, client)
+            insert_data(collection, supervisors)
             create_index_if_needed(collection)
+            collection.load()
         else:
             print("Using existing collection...")
             collection = Collection(collection_name)
-            create_index_if_needed(collection)  # Make sure the index exists for existing collection
+            create_index_if_needed(collection)
+            collection.load()
 
-        # Always verify data
-        check_all_milvus_data(collection_name)
-
-         #Example: Add a new supervisor
-        # new_supervisor = {
-        #      "id": 3,
-        #      "nazwa": "Dr. Piotr Wiśniewski",
-        #      "zainteresowania": [
-        #          "Robotyka",
-        #          "Internet rzeczy (IoT)",
-        #          "Automatyzacja przemysłowa"
-        #      ]
-        # }
-        # add_new_supervisor(collection_name, new_supervisor, client)
-
-        # Run Flask application (this should be the last step)
         app.run(host='0.0.0.0', port=5000)
 
     except Exception as e:
-        print(f"Wystąpił błąd: {e}")
+        print(f"An error occurred: {e}")
     finally:
         connections.disconnect("default")
