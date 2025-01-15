@@ -1,0 +1,5 @@
+flask==3.1.0
+openai==1.59.7
+pymilvus==2.5.0
+pandas==2.2.3
+openpyxl==3.1.4
