@@ -1,4 +1,5 @@
 import os
+from dotenv import load_dotenv
 import pandas as pd
 from openai import OpenAI
 from pymilvus import connections, FieldSchema, CollectionSchema, DataType, Collection, utility
@@ -6,6 +7,8 @@ from flask import Flask, request, jsonify, render_template
 
 collection_name = "supervisor_interests"
 app = Flask(__name__, static_folder='static')
+
+load_dotenv()
 
 def connect_milvus(host='localhost', port='19530'):
     connections.connect(alias="default", host=host, port=port)
